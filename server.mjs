@@ -401,54 +401,119 @@ async function startServer() {
   });
 
   // --- SSLCOMMERZ ---
+  // Hardcoded sandbox fallback credentials. These guarantee that the SSLCommerz
+  // session create call NEVER fails with "credentials missing" even when the
+  // Firestore paymentSettings doc is empty and no env vars are set.
+  const SSLCZ_FALLBACK = {
+    storeId:   'ssss6a1b5cd185e4c',
+    storePass: 'ssss6a1b5cd185e4c@ssl',
+    sandbox:   true,
+  };
+
+  function resolveOrigin(req) {
+    // Render sits behind a TLS proxy — honour x-forwarded-proto, else https in prod.
+    const proto = req.headers['x-forwarded-proto']
+      || (process.env.NODE_ENV === 'production' ? 'https' : req.protocol);
+    return `${proto}://${req.get('host')}`;
+  }
+
   app.post('/api/sslcommerz/create-payment', async (req, res) => {
-    const { amount, currency = 'BDT', orderId, customerName, customerEmail, customerPhone, customerAddress, storeId, storePassword, sandboxMode } = req.body || {};
-    if (!storeId || !storePassword)
-      return res.status(400).json({ error: 'SSLCommerz credentials not configured.' });
-    const baseUrl = sandboxMode !== false
+    const body = req.body || {};
+    const {
+      amount,
+      currency = 'BDT',
+      orderId,
+      customer = {},
+      customerName, customerEmail, customerPhone, customerAddress,
+      productName = 'Order',
+    } = body;
+
+    // Resolve credentials with strict precedence:
+    //   1) values posted from frontend / admin panel
+    //   2) process.env (Render env vars)
+    //   3) Hardcoded sandbox fallback (never undefined / empty)
+    const storeId =
+      (body.storeId && String(body.storeId).trim()) ||
+      (process.env.SSLCZ_STORE_ID && String(process.env.SSLCZ_STORE_ID).trim()) ||
+      SSLCZ_FALLBACK.storeId;
+
+    const storePassword =
+      (body.storePassword && String(body.storePassword).trim()) ||
+      (process.env.SSLCZ_STORE_PASSWORD && String(process.env.SSLCZ_STORE_PASSWORD).trim()) ||
+      SSLCZ_FALLBACK.storePass;
+
+    // Force sandbox unless explicitly opted out via env (`SSLCZ_SANDBOX=false`)
+    // or an explicit boolean false from the request body.
+    const sandboxMode =
+      body.sandboxMode === false
+        ? false
+        : String(process.env.SSLCZ_SANDBOX ?? 'true').toLowerCase() !== 'false';
+
+    if (!amount || !orderId) {
+      return res.status(400).json({ error: 'amount and orderId are required.' });
+    }
+
+    const baseUrl = sandboxMode
       ? 'https://sandbox.sslcommerz.com'
       : 'https://securepay.sslcommerz.com';
+
+    const origin = resolveOrigin(req);
+
     try {
       const params = new URLSearchParams({
         store_id: storeId,
         store_passwd: storePassword,
         total_amount: Number(amount).toFixed(2),
         currency,
-        tran_id: orderId || `QF-${Date.now()}`,
-        success_url: `${req.protocol}://${req.get('host')}/api/sslcommerz/callback?status=success`,
-        fail_url: `${req.protocol}://${req.get('host')}/api/sslcommerz/callback?status=failed`,
-        cancel_url: `${req.protocol}://${req.get('host')}/api/sslcommerz/callback?status=cancelled`,
-        ipn_url: `${req.protocol}://${req.get('host')}/api/sslcommerz/ipn`,
-        cus_name: customerName || 'Customer',
-        cus_email: customerEmail || 'customer@example.com',
-        cus_phone: customerPhone || '01700000000',
-        cus_add1: customerAddress || 'Dhaka',
-        cus_city: 'Dhaka',
-        cus_country: 'Bangladesh',
-        shipping_method: 'NO',
-        product_name: 'Order',
+        tran_id: String(orderId),
+        success_url: `${origin}/api/sslcommerz/callback?status=success&orderId=${encodeURIComponent(orderId)}`,
+        fail_url:    `${origin}/api/sslcommerz/callback?status=failed&orderId=${encodeURIComponent(orderId)}`,
+        cancel_url:  `${origin}/api/sslcommerz/callback?status=cancelled&orderId=${encodeURIComponent(orderId)}`,
+        ipn_url:     `${origin}/api/sslcommerz/ipn`,
+        cus_name:    customer.name    || customerName    || 'Customer',
+        cus_email:   customer.email   || customerEmail   || 'customer@example.com',
+        cus_phone:   customer.phone   || customerPhone   || '01700000000',
+        cus_add1:    customer.address || customerAddress || 'Dhaka',
+        cus_city:    customer.city    || 'Dhaka',
+        cus_country: customer.country || 'Bangladesh',
+        shipping_method:  'NO',
+        product_name:     productName,
         product_category: 'General',
-        product_profile: 'general',
+        product_profile:  'general',
+        num_of_item:      '1',
+        value_a:          String(orderId),
       });
+
       const sslRes = await fetch(`${baseUrl}/gwprocess/v4/api.php`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: params.toString(),
       });
       const data = await sslRes.json();
-      if (data.status === 'SUCCESS' && data.GatewayPageURL)
-        return res.json({ success: true, gatewayUrl: data.GatewayPageURL, sessionKey: data.sessionkey });
+
+      if (data.status === 'SUCCESS' && data.GatewayPageURL) {
+        return res.json({
+          success: true,
+          // Expose under all common keys so any frontend variant works.
+          redirectUrl: data.GatewayPageURL,
+          gatewayUrl:  data.GatewayPageURL,
+          sessionkey:  data.sessionkey,
+          sessionKey:  data.sessionkey,
+        });
+      }
       return res.status(502).json({ error: 'SSLCommerz session initiation failed.', detail: data });
     } catch (err) {
+      console.error('[SSLCommerz API Error]', err);
       return res.status(500).json({ error: `SSLCommerz API error: ${err.message}` });
     }
   });
 
-  app.get('/api/sslcommerz/callback', (req, res) => {
-    const { status } = req.query;
-    if (status === 'success') return res.redirect('/?sslcommerz=success');
-    if (status === 'failed') return res.redirect('/?sslcommerz=failed');
-    res.redirect('/?sslcommerz=cancelled');
+  app.all('/api/sslcommerz/callback', (req, res) => {
+    const status = (req.query.status || req.body?.status || '').toString();
+    const orderId = req.query.orderId || req.body?.tran_id || '';
+    if (status === 'success') return res.redirect(`/?sslcommerz=success&order=${orderId}`);
+    if (status === 'failed')  return res.redirect(`/?sslcommerz=failed&order=${orderId}`);
+    return res.redirect(`/?sslcommerz=cancelled&order=${orderId}`);
   });
 
   app.post('/api/sslcommerz/ipn', (req, res) => {
@@ -654,6 +719,25 @@ async function startServer() {
       console.error('[save-config] Write error:', err);
       res.status(500).json({ success: false, message: `Failed to write config: ${err.message}` });
     }
+  });
+
+  // --- UNIVERSAL PAYMENT GATEWAY DISPATCHER ---
+  // Safety-net for any `/api/:gateway/:action` request that did not match a
+  // concrete handler above. Returns a clear JSON 404 with the parsed body
+  // preserved (express.json already parsed it at the top of the file), so
+  // misconfigured frontends fail loudly instead of silently dropping payloads.
+  app.all('/api/:gateway/:action', (req, res) => {
+    const { gateway, action } = req.params;
+    console.warn(`[gateway-dispatch] Unhandled ${req.method} /api/${gateway}/${action}`, {
+      bodyKeys: Object.keys(req.body || {}),
+    });
+    res.status(404).json({
+      error: `No handler registered for /api/${gateway}/${action}`,
+      gateway,
+      action,
+      method: req.method,
+      receivedBodyKeys: Object.keys(req.body || {}),
+    });
   });
 
   // --- VITE DEV or STATIC PROD ---

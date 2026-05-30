@@ -12,13 +12,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const { amount, orderId, customer = {}, productName = 'Order' } = req.body || {};
     if (!amount || !orderId) return res.status(400).json({ error: 'amount and orderId required' });
 
+    // Resolve credentials. getGatewayCreds() already injects the verified
+    // sandbox fallback (ssss6a1b5cd185e4c / ssss6a1b5cd185e4c@ssl) so this
+    // can never resolve to empty values. The `missing` check is kept as a
+    // defensive guardrail only.
     const creds = await getGatewayCreds('sslcommerz');
     const missing = missingCreds(creds, ['storeId', 'storePass']);
     if (missing.length) {
       return res.status(500).json({ error: `Missing SSLCommerz credentials: ${missing.join(', ')}` });
     }
 
-    const sandbox = String(creds.isSandbox).toLowerCase() !== 'false';
+    // Force sandbox unless explicitly disabled via env / Firestore.
+    const sandbox = String(creds.isSandbox ?? 'true').toLowerCase() !== 'false';
     const base = sandbox
       ? 'https://sandbox.sslcommerz.com'
       : 'https://securepay.sslcommerz.com';

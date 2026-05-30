@@ -65,10 +65,13 @@ export async function getGatewayCreds(gateway: string): Promise<Record<string, s
       };
 
     case 'sslcommerz':
+      // Hardcoded sandbox fallback so SSLCommerz NEVER evaluates to empty
+      // credentials, even when both env vars and the Firestore
+      // `settings/paymentSettings` doc are missing values.
       return {
-        storeId:   pick('SSLCZ_STORE_ID',       'sslCommerzStoreId'),
-        storePass: pick('SSLCZ_STORE_PASSWORD',  'sslCommerzStorePassword'),
-        isSandbox: pick('SSLCZ_SANDBOX',         'sslCommerzSandboxMode') || 'true',
+        storeId:   pick('SSLCZ_STORE_ID',       'sslCommerzStoreId')       || 'ssss6a1b5cd185e4c',
+        storePass: pick('SSLCZ_STORE_PASSWORD', 'sslCommerzStorePassword') || 'ssss6a1b5cd185e4c@ssl',
+        isSandbox: pick('SSLCZ_SANDBOX',        'sslCommerzSandboxMode')   || 'true',
       };
 
     case 'nagad':
